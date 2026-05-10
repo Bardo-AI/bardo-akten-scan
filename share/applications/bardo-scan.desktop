@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Bardo Akten-Scan
+Name[de]=Bardo Akten-Scan
+Comment=Document digitization for ADF/duplex scanners with OCR
+Comment[de]=Akten-Digitalisierung für ADF/Duplex-Scanner mit OCR (300 dpi, Auto-Deskew, Skip-Blank, Multifeed-Detection)
+Exec=bardo-scan
+Icon=bardo-scan
+Terminal=false
+Categories=Office;Graphics;Scanning;
+Keywords=scan;scanner;akten;ocr;brother;ads-4900w;mfc-l5700dn;
+StartupNotify=true

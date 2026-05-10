@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""bardo-duplex-merge — manuelle Duplex-Emulation für Scanner ohne Duplex-Einheit.
+
+Workflow für Single-Sided-Scanner (z.B. alter MFC-L5700DN):
+  1. Stapel ganz normal scannen        → Job_A (Vorderseiten 1..N)
+  2. Stapel umdrehen + nochmals scannen → Job_B (Rückseiten N..1, also umgekehrt)
+  3. bardo-duplex-merge Job_A Job_B [aktenordner-name]
+  4. → neuer Job mit 2*N Seiten in korrekter Duplex-Reihenfolge
+
+Aufruf:
+  bardo-duplex-merge <vorderseiten-job-pfad> <rueckseiten-job-pfad> [zielordner-name]
+
+Beispiel:
+  bardo-duplex-merge \\
+    ~/Akten-Scans/test1/20260508-224516 \\
+    ~/Akten-Scans/test1/20260508-224633
+
+Wenn kein Zielordner-Name angegeben, wird der Name vom übergeordneten Ordner des
+Vorderseiten-Jobs übernommen (hier: 'test1').
+"""
+import sys
+import os
+import re
+import shutil
+import subprocess
+import hashlib
+import json
+import argparse
+from pathlib import Path
+from datetime import datetime
+
+
+SCAN_BASE = Path(
+    os.environ.get("BARDO_SCAN_BASE", str(Path.home() / "Akten-Scans"))
+).expanduser()
+
+
+# Stapel-Orientierungs-Modi
+# Mode -> ((src1_kind, idx1_fn), (src2_kind, idx2_fn))
+#   kind: "f" = front_pdfs/front_txts, "b" = back_pdfs/back_txts
+#   idx_fn(i, n) -> int liefert den Array-Index für Blatt i
+MODE_RULES = {
+    "a": (("f", lambda i, n: i),         ("b", lambda i, n: n - 1 - i)),
+    "b": (("f", lambda i, n: n - 1 - i), ("b", lambda i, n: i)),
+    "c": (("b", lambda i, n: i),         ("f", lambda i, n: n - 1 - i)),
+    "d": (("b", lambda i, n: n - 1 - i), ("f", lambda i, n: i)),
+}
+
+MODE_ALIASES = {
+    "flip-short":     "a",
+    "flip-long":      "b",
+    "reverse-both":   "c",
+    "same-direction": "d",
+}
+
+MODE_DESCRIPTIONS = {
+    "a": "front[i] + back[N-1-i]  (Standard, MFC-L5700DN — 'Karte umdrehen')",
+    "b": "front[N-1-i] + back[i]  ('lange Kante drehen')",
+    "c": "back[i] + front[N-1-i]  ('beide Stapel umgekehrt')",
+    "d": "back[N-1-i] + front[i]  ('gleich-Richtung-Trick')",
+}
+
+
+def clean_env():
+    env = os.environ.copy()
+    for v in ["LD_LIBRARY_PATH", "CONDA_PREFIX", "PYTHONHOME"]:
+        env.pop(v, None)
+    return env
+
+
+def page_files(job_dir, subdir, ext):
+    """Listet sortierte page*.<ext> aus job_dir/<subdir>/."""
+    p = Path(job_dir) / subdir
+    if not p.is_dir():
+        return []
+    return sorted(p.glob(f"page*.{ext}"))
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def main():
+    mode_choices = list(MODE_RULES.keys()) + list(MODE_ALIASES.keys())
+    parser = argparse.ArgumentParser(
+        prog="bardo-duplex-merge",
+        description=(
+            "Manuelle Duplex-Emulation für Single-Sided-Scanner. "
+            "Zwei Scan-Job-Ordner werden zu einem Duplex-Output gemergt."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Modi:\n"
+            "  a / flip-short      " + MODE_DESCRIPTIONS["a"] + "\n"
+            "  b / flip-long       " + MODE_DESCRIPTIONS["b"] + "\n"
+            "  c / reverse-both    " + MODE_DESCRIPTIONS["c"] + "\n"
+            "  d / same-direction  " + MODE_DESCRIPTIONS["d"] + "\n"
+            "\n"
+            "Bei falscher Sortierung: nächsten Modus probieren —\n"
+            "Quell-Ordner bleiben unverändert."
+        ),
+    )
+    parser.add_argument("front", help="Pfad zum Vorderseiten-Job (erster Scan)")
+    parser.add_argument("back", help="Pfad zum Rückseiten-Job (zweiter Scan)")
+    parser.add_argument(
+        "aktenordner", nargs="?",
+        help="Zielordner-Name (optional, default: übergeordneter Ordner des Vorderseiten-Jobs)"
+    )
+    parser.add_argument(
+        "--mode", default="a", choices=mode_choices, metavar="MODE",
+        help="Stapel-Orientierung (default: a / flip-short)"
+    )
+    args = parser.parse_args()
+
+    mode = MODE_ALIASES.get(args.mode, args.mode)
+
+    front_dir = Path(args.front).resolve()
+    back_dir = Path(args.back).resolve()
+    aktenordner_arg = args.aktenordner
+
+    if not front_dir.is_dir():
+        sys.exit(f"Fehler: {front_dir} ist kein Ordner")
+    if not back_dir.is_dir():
+        sys.exit(f"Fehler: {back_dir} ist kein Ordner")
+
+    front_pdfs = page_files(front_dir, "pdf", "pdf")
+    back_pdfs = page_files(back_dir, "pdf", "pdf")
+    if not front_pdfs:
+        sys.exit(f"Fehler: keine pdf/page*.pdf in {front_dir}")
+    if not back_pdfs:
+        sys.exit(f"Fehler: keine pdf/page*.pdf in {back_dir}")
+    if len(front_pdfs) != len(back_pdfs):
+        sys.exit(
+            f"Fehler: Seitenzahlen unterschiedlich:\n"
+            f"  Vorderseiten: {len(front_pdfs)} aus {front_dir}\n"
+            f"  Rückseiten:   {len(back_pdfs)} aus {back_dir}\n"
+            f"  Stapel müssen identisch viele Blätter haben."
+        )
+
+    n = len(front_pdfs)
+    print(f"Duplex-Merge: {n} Vorderseiten + {n} Rückseiten = {2*n} Duplex-Seiten gesamt")
+    print(f"  Vorderseiten-Job: {front_dir}")
+    print(f"  Rückseiten-Job:   {back_dir}")
+
+    # Zielordner: <aktenordner>/<timestamp>-duplex
+    if aktenordner_arg:
+        aktenordner = re.sub(r"[^A-Za-z0-9_äöüÄÖÜß-]", "_", aktenordner_arg)
+    else:
+        aktenordner = front_dir.parent.name
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    job_name = f"{timestamp}-duplex"
+    out_dir = SCAN_BASE / aktenordner / job_name
+    out_pdf = out_dir / "pdf"
+    out_txt = out_dir / "txt"
+    out_pdf.mkdir(parents=True, exist_ok=True)
+    out_txt.mkdir(exist_ok=True)
+    print(f"  Output:           {out_dir}")
+
+    # Interleave-Logik via Mode-Rules:
+    #   MODE_RULES[mode] -> ((src1_kind, idx1_fn), (src2_kind, idx2_fn))
+    #   mode='a' = MFC-L5700DN-Default: front[i] + back[N-1-i]
+    front_txts = page_files(front_dir, "txt", "txt")
+    back_txts = page_files(back_dir, "txt", "txt")
+
+    arrays_pdf = {"f": front_pdfs, "b": back_pdfs}
+    arrays_txt = {"f": front_txts, "b": back_txts}
+    rules = MODE_RULES[mode]
+
+    print()
+    print(f"Interleave-Modus: {mode} — {MODE_DESCRIPTIONS[mode]}")
+    out_idx = 0
+    sample_lines = []
+    for i in range(n):
+        slot_descrs = []
+        for src_kind, idx_fn in rules:
+            idx = idx_fn(i, n)
+            out_idx += 1
+            src_pdf = arrays_pdf[src_kind][idx]
+            shutil.copy2(src_pdf, out_pdf / f"page{out_idx:04d}.pdf")
+            txts = arrays_txt[src_kind]
+            if idx < len(txts):
+                shutil.copy2(txts[idx], out_txt / f"page{out_idx:04d}.txt")
+            slot_descrs.append(f"page{out_idx:04d}={'run1' if src_kind=='f' else 'run2'}/{src_pdf.name}")
+
+        if i < 3 or i >= n - 1:
+            sample_lines.append(f"  Blatt {i+1:3d}: " + "  ".join(slot_descrs))
+        elif i == 3:
+            sample_lines.append("  ...")
+
+    for line in sample_lines:
+        print(line)
+
+    # Bulk Searchable PDF — pdfunite über alle interleaved page-PDFs
+    all_pdfs = sorted(out_pdf.glob("page*.pdf"))
+    bulk_searchable = out_dir / f"{job_name}.searchable.pdf"
+    print()
+    print(f"Erzeuge Bulk-Searchable-PDF aus {len(all_pdfs)} Einzelseiten...")
+    r = subprocess.run(
+        ["pdfunite"] + [str(p) for p in all_pdfs] + [str(bulk_searchable)],
+        capture_output=True, text=True, env=clean_env(), timeout=300
+    )
+    if r.returncode != 0:
+        print(f"  pdfunite-Fehler: {r.stderr.strip()}")
+    else:
+        print(f"  Bulk: {bulk_searchable.name} "
+              f"({bulk_searchable.stat().st_size/1024/1024:.1f} MB)")
+
+    # Merge-Info als Sidecar (Provenienz)
+    merge_info = {
+        "merge_time": datetime.now().isoformat(),
+        "type": "manual_duplex_emulation",
+        "mode": mode,
+        "interleave_pattern": MODE_DESCRIPTIONS[mode],
+        "pages_total": 2 * n,
+        "sheets_total": n,
+        "sources": {
+            "front": {
+                "path": str(front_dir),
+                "pages": n,
+            },
+            "back": {
+                "path": str(back_dir),
+                "pages": n,
+            },
+        },
+        "output": {
+            "bulk_searchable_pdf": str(bulk_searchable.relative_to(out_dir)),
+            "page_pdfs_count": len(all_pdfs),
+            "page_txts_count": len(list(out_txt.glob('page*.txt'))),
+        },
+        "note": (
+            "Beweis-Charakter: die Original-Beweis-PDFs liegen UNVERÄNDERT in den "
+            "Source-Job-Ordnern. Dieser Merge ist Derivat — bei Zweifel beide "
+            "Source-Jobs als Beweis vorlegen."
+        ),
+    }
+    (out_dir / "_merge_info.json").write_text(
+        json.dumps(merge_info, indent=2, ensure_ascii=False)
+    )
+
+    # SHA256-Manifest über alle Outputs
+    print()
+    print("Schreibe Manifest...")
+    files = (
+        sorted(out_dir.glob("*.pdf"))
+        + sorted(out_pdf.glob("*.pdf"))
+        + sorted(out_txt.glob("*.txt"))
+    )
+    manifest_lines = [
+        f"# Bardo Duplex-Merge Manifest",
+        f"# Generiert: {datetime.now().isoformat()}",
+        f"# Source Vorderseiten: {front_dir}",
+        f"# Source Rückseiten:   {back_dir}",
+        f"# Output:              {out_dir}",
+        f"# Dateien:             {len(files)}",
+        f"#",
+    ]
+    for p in files:
+        h = sha256_file(p)
+        rel = p.relative_to(out_dir)
+        manifest_lines.append(f"{h}  {rel}")
+    (out_dir / "sha256.txt").write_text("\n".join(manifest_lines) + "\n")
+
+    print()
+    print(f"Fertig: {out_dir}")
+    print(f"  Searchable Bulk-PDF: {bulk_searchable.name}")
+    print(f"  Einzelseiten:        pdf/page0001.pdf ... page{2*n:04d}.pdf")
+    print(f"  TXT-Dateien:         txt/page0001.txt ... page{2*n:04d}.txt")
+    print(f"  Manifest:            sha256.txt ({len(files)} Dateien)")
+    print(f"  Provenance:          _merge_info.json")
+
+
+if __name__ == "__main__":
+    main()

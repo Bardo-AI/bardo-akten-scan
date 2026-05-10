@@ -1,0 +1,1112 @@
+#!/usr/bin/env python3
+"""
+bardo-scan — Mini-GUI für Akten-Digitalisierung über Brother ADS-4900W
+
+Workflow:
+- User gibt Aktenordner-Namen ein
+- Setzt Optionen (Auflösung, Modus, Duplex, Auto-Features)
+- Klickt "SCAN STARTEN"
+- Bestätigt nach Warnung
+- Scanner zieht Stapel durch
+- Output landet in ~/Akten-Scans/<ordner>/<YYYYMMDD-HHMMSS>/page0001.jpg, page0002.jpg, ...
+
+Läuft als System-Python3 mit Tkinter (kein conda-env nötig).
+"""
+import os
+import re
+import sys
+import time
+import subprocess
+import threading
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+
+SCAN_BASE = Path(
+    os.environ.get("BARDO_SCAN_BASE", str(Path.home() / "Akten-Scans"))
+).expanduser()
+
+
+def clean_env():
+    """Bardo/textgen-env-Kontamination strippen für saubere System-Tools."""
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("CONDA_PREFIX", None)
+    env.pop("PYTHONHOME", None)
+    return env
+
+
+def list_all_scanners():
+    """Findet alle verfügbaren SANE-Scanner.
+    Returns Liste von Dicts: [{device, model, backend, priority}, ...]
+    sortiert nach Eignung (Brother ADS bevorzugt, dann MFC, dann generic).
+
+    Filtert airscan-Doppel-Einträge raus wenn ein direkter escl-Pfad fürs
+    gleiche Modell existiert — airscan hat bei Brother-Flatbed einen
+    bekannten I/O-Error-Bug, der escl-Pfad ist sauber."""
+    scanners = []
+    try:
+        result = subprocess.run(
+            ["scanimage", "-L"],
+            capture_output=True, text=True, timeout=25, env=clean_env()
+        )
+        for line in result.stdout.splitlines():
+            m = re.match(r"device `([^']+)' is a (.*)", line)
+            if not m:
+                continue
+            device, descr = m.group(1), m.group(2)
+            backend = device.split(":", 1)[0] if ":" in device else "unknown"
+            model_match = re.search(r"(ADS-\w+|MFC-\w+|DCP-\w+|HL-\w+)", descr)
+            model = model_match.group(1) if model_match else descr.split()[0] if descr else "Scanner"
+            if "ADS-" in model:
+                priority = 1
+            elif backend == "brother5":
+                priority = 2
+            elif "MFC-" in model and backend == "escl":
+                priority = 3
+            elif backend == "brother4":
+                priority = 4
+            elif backend == "escl":
+                priority = 5
+            elif backend == "airscan":
+                priority = 6
+            else:
+                priority = 9
+            scanners.append({
+                "device": device,
+                "model": model,
+                "backend": backend,
+                "descr": descr,
+                "priority": priority,
+            })
+    except Exception as e:
+        print(f"list_all_scanners error: {e}", file=sys.stderr)
+
+    # Filter: airscan-Eintrag rauswerfen wenn escl/brother{4,5} dasselbe Modell deckt
+    # (airscan hat bei Brother bekannte Flatbed-I/O-Bugs)
+    models_with_native = {s["model"] for s in scanners
+                          if s["backend"] in ("escl", "brother4", "brother5")}
+    scanners = [s for s in scanners
+                if not (s["backend"] == "airscan" and s["model"] in models_with_native)]
+
+    scanners.sort(key=lambda s: s["priority"])
+    return scanners
+
+
+def detect_scanner():
+    """Backwards-compat: gibt das erst-präferierte Gerät zurück."""
+    scanners = list_all_scanners()
+    return scanners[0]["device"] if scanners else None
+
+
+def parse_device_capabilities(device):
+    """Liest scanimage --help -d <device> und extrahiert verfügbare Optionen.
+    Returns Dict mit modes, sources, resolutions, active_options.
+    Robust gegen verschiedene Backends (brscan4, brscan5, escl, airscan)."""
+    caps = {
+        "modes": [],
+        "sources": [],
+        "resolutions": [],
+        "active_options": set(),
+        "max_x_mm": None,
+        "max_y_mm": None,
+    }
+    try:
+        r = subprocess.run(
+            ["scanimage", "-d", device, "--help"],
+            capture_output=True, text=True, timeout=25, env=clean_env()
+        )
+        if r.returncode != 0:
+            return caps
+        for line in r.stdout.splitlines():
+            # --mode A|B|C [Default]
+            m = re.search(r"--mode\s+(.+?)\s+\[", line)
+            if m and not caps["modes"]:
+                caps["modes"] = [s.strip() for s in m.group(1).split("|")]
+            # --resolution 100|200|300dpi
+            m = re.search(r"--resolution\s+([\d|]+)\s*dpi?", line)
+            if m and not caps["resolutions"]:
+                caps["resolutions"] = m.group(1).split("|")
+            # --source A|B|C [Default]  — schwierig wegen Klammern in Brother-Namen
+            m = re.search(r"--source\s+(.+?)(?:\s*\[|$)", line)
+            if m and not caps["sources"]:
+                src_str = m.group(1).strip()
+                # Trenner | aber NICHT in Klammern — Brother nutzt 'X(a,b)|Y(c,d)'
+                parts, depth, current = [], 0, ""
+                for ch in src_str:
+                    if ch == "(":
+                        depth += 1; current += ch
+                    elif ch == ")":
+                        depth -= 1; current += ch
+                    elif ch == "|" and depth == 0:
+                        parts.append(current.strip()); current = ""
+                    else:
+                        current += ch
+                if current.strip():
+                    parts.append(current.strip())
+                caps["sources"] = parts
+            # max scan area (-x bzw -y)
+            m = re.search(r"-x\s+[\d.]+\.\.([\d.]+)mm", line)
+            if m: caps["max_x_mm"] = float(m.group(1))
+            m = re.search(r"-y\s+[\d.]+\.\.([\d.]+)mm", line)
+            if m: caps["max_y_mm"] = float(m.group(1))
+            # active options (Brother-spezifische Auto-Features)
+            if "[inactive]" not in line:
+                m = re.match(r"\s+--([A-Za-z][A-Za-z0-9_]*)", line)
+                if m:
+                    caps["active_options"].add(m.group(1))
+    except Exception as e:
+        print(f"parse_device_capabilities error: {e}", file=sys.stderr)
+    return caps
+
+
+def probe_active_options(device):
+    """Backwards-compat: nur die active_options."""
+    return parse_device_capabilities(device).get("active_options") or None
+
+
+def list_tesseract_langs():
+    """Verfügbare Tesseract-Sprachen via `tesseract --list-langs`.
+    Gibt sortierte Liste; fügt 'deu+eng' an Spitze wenn beide verfügbar.
+    Fallback ['deu'] wenn Probe fehlschlägt."""
+    try:
+        r = subprocess.run(
+            ["tesseract", "--list-langs"],
+            capture_output=True, text=True, timeout=10, env=clean_env()
+        )
+        # Tesseract gibt die Liste je nach Version nach stderr oder stdout
+        out = (r.stdout or "") + "\n" + (r.stderr or "")
+        langs = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("List of") or ":" in line:
+                continue
+            # 'osd' (Orientation/Script Detection) und 'equ' (Math-Equation)
+            # sind Tesseract-Pseudo-Sprachen, kein OCR-Inhalt
+            if line in ("osd", "equ"):
+                continue
+            # Tesseract-Sprachcodes sind 2-12 Buchstaben (deu, eng, chi_sim, ...)
+            if 2 <= len(line) <= 12 and line.replace("_", "").isalpha():
+                langs.append(line)
+        langs = sorted(set(langs))
+        if not langs:
+            return ["deu"]
+        result = list(langs)
+        # Convenience: deu+eng-Kombination an Spitze wenn beide da
+        if "deu" in langs and "eng" in langs:
+            result.insert(0, "deu+eng")
+        return result
+    except Exception as e:
+        print(f"list_tesseract_langs error: {e}", file=sys.stderr)
+        return ["deu"]
+
+
+def classify_source(s):
+    """Klassifiziert einen SANE-Source-String nach Quelle und Duplex-Eigenschaft.
+    Returns Tuple (label, has_duplex):
+      - label = 'Mehrfacheinzug' / 'Auflagenglas' / None (unbekannt)
+      - has_duplex = True/False (ob die Source Hardware-Duplex bedeutet)
+    Center/Left-Aligned ist Hardware-Detail, gehört nicht ins Label."""
+    s_lower = s.lower()
+    has_duplex = "duplex" in s_lower
+    is_adf = "feeder" in s_lower or s_lower.startswith("adf") or s_lower == "adf"
+    is_flatbed = "flatbed" in s_lower or "platen" in s_lower
+    if is_adf:
+        return ("Mehrfacheinzug", has_duplex)
+    if is_flatbed:
+        return ("Auflagenglas", False)
+    return (None, False)
+
+
+def best_default(values, preferences):
+    """Gibt aus values den ersten Wert zurück der in preferences (Liste)
+    in Reihenfolge gefunden wird. Fallback: erstes Element von values."""
+    for pref in preferences:
+        for v in values:
+            if pref.lower() in v.lower():
+                return v
+    return values[0] if values else None
+
+
+class BardoScanApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Bardo Akten-Scan")
+        self.root.geometry("780x950")
+        self.root.minsize(680, 760)
+
+        self.scanning = False
+        self.duplex_running = False
+        self.device = None
+        self.devices = []   # Liste aller gefundenen Scanner-Dicts
+        self.caps = None    # parse_device_capabilities-Output für aktuelles Gerät
+        self._last_output = None
+        self._duplex_last_output = None
+
+        self._build_ui()
+        self.root.after(100, self._detect_initial)
+
+    def _detect_initial(self):
+        self.log("Suche Scanner via SANE...")
+        self.devices = list_all_scanners()
+        if not self.devices:
+            self.device_label.config(
+                text="Kein Scanner gefunden — angeschlossen? Eingeschaltet?",
+                fg="#c00"
+            )
+            self.log("FEHLER: Keine SANE-Geräte gefunden.")
+            return
+        # Combobox-Werte: "Modell — Backend (device)"
+        self.device_combo["values"] = [
+            f"{d['model']} — {d['backend']} ({d['device']})" for d in self.devices
+        ]
+        self.device_combo.current(0)  # erst-präferiertes
+        self.device_label.config(
+            text=f"{len(self.devices)} Scanner gefunden", fg="#0a0"
+        )
+        for d in self.devices:
+            self.log(f"  [{d['priority']}] {d['model']} via {d['backend']}: {d['device']}")
+        self._on_device_change()
+
+    def _on_device_change(self, event=None):
+        """User wechselt das Gerät → Capabilities neu laden, Dropdowns neu füllen.
+        Bei Backends die --help nicht voll auflösen (brother4 minimal, airscan ohne Device-Open)
+        werden Fallback-Defaults gesetzt damit Scan trotzdem versucht werden kann."""
+        idx = self.device_combo.current()
+        if idx < 0 or idx >= len(self.devices):
+            return
+        self.device = self.devices[idx]["device"]
+        backend = self.devices[idx]["backend"]
+        self.log(f"Lade Optionen für: {self.device}")
+        self.caps = parse_device_capabilities(self.device)
+
+        # Backend-spezifische Fallbacks wenn --help leer kam
+        if not self.caps["modes"]:
+            if backend == "brother4":
+                self.caps["modes"] = ["Black & White", "Gray", "True Gray", "24bit Color"]
+            elif backend == "brother5":
+                self.caps["modes"] = ["Black & White", "True Gray", "24bit Color[Fast]"]
+            else:
+                self.caps["modes"] = ["Lineart", "Gray", "Color"]
+        if not self.caps["sources"]:
+            if backend == "brother4":
+                self.caps["sources"] = ["FlatBed", "Automatic Document Feeder(left aligned)"]
+            elif backend == "brother5":
+                self.caps["sources"] = [
+                    "Automatic Document Feeder(center aligned,Duplex)",
+                    "Automatic Document Feeder(center aligned)",
+                ]
+            else:
+                self.caps["sources"] = ["Flatbed", "ADF"]
+        if not self.caps["resolutions"]:
+            self.caps["resolutions"] = ["100", "200", "300", "600"]
+
+        # Dropdowns füllen
+        self.resolution["values"] = self.caps["resolutions"]
+        for pref in ["300", "200", "400", "150", "600"]:
+            if pref in self.caps["resolutions"]:
+                self.resolution.set(pref); break
+        else:
+            self.resolution.set(self.caps["resolutions"][0])
+
+        self.mode["values"] = self.caps["modes"]
+        self.mode.set(best_default(self.caps["modes"],
+                                    ["True Gray", "Gray", "Color", "Lineart"]))
+
+        # Source-Mapping: Label -> {"single": str|None, "duplex": str|None}
+        # Pro Quelle (Mehrfacheinzug/Auflagenglas) zwei Slots —
+        # die Hardware-Duplex-Variante separiert.
+        # Brother ADS-Reihe hat physisch kein Auflagenglas, auch wenn
+        # der brother4-Generic-Treiber 'FlatBed' als String exponiert —
+        # filtern.
+        model = self.devices[idx]["model"]
+        is_pure_adf = model.startswith("ADS-")
+        self._source_map = {}
+        # Center-Aligned bevorzugt (typischer ADF-Default), sonst left/anderes
+        ordered = sorted(
+            self.caps["sources"],
+            key=lambda s: (0 if "center" in s.lower() else 1)
+        )
+        for raw in ordered:
+            label, has_duplex = classify_source(raw)
+            if label is None:
+                continue
+            if label == "Auflagenglas" and is_pure_adf:
+                continue  # ADS hat kein Glas, Treiber-Quirk ignorieren
+            slot = "duplex" if has_duplex else "single"
+            if label not in self._source_map:
+                self._source_map[label] = {"single": None, "duplex": None}
+            if self._source_map[label][slot] is None:
+                self._source_map[label][slot] = raw
+        # Anzeige-Reihenfolge: Mehrfacheinzug zuerst, dann Auflagenglas
+        priority = {"Mehrfacheinzug": 0, "Auflagenglas": 1}
+        display_labels = sorted(self._source_map.keys(),
+                                key=lambda l: priority.get(l, 9))
+        self.source["values"] = display_labels
+        if display_labels:
+            self.source.set(display_labels[0])
+        # Bei Source-Wechsel: Hinweis und Duplex-Checkbox aktualisieren
+        self.source.bind("<<ComboboxSelected>>",
+                         lambda e: (self._update_physical_hint(),
+                                    self._update_duplex_checkbox()))
+        self._update_physical_hint()
+        self._update_duplex_checkbox()
+
+        self._update_feature_availability()
+        self.log(f"  Backend: {backend}")
+        self.log(f"  Modes:   {self.caps['modes']}")
+        self.log(f"  Sources: {self.caps['sources']}")
+        self.log(f"  Auflös.: {self.caps['resolutions']} dpi")
+        if self.caps["active_options"]:
+            self.log(f"  Active opts: {sorted(self.caps['active_options'])}")
+        else:
+            self.log(f"  (kein --help-Output, Fallback-Defaults aktiv)")
+
+    def _update_duplex_checkbox(self):
+        """Aktiviert/deaktiviert die Beidseitig-Scannen-Checkbox je nach aktueller
+        Quelle. Aktiv nur bei Mehrfacheinzug + Hardware-Duplex-Variante verfügbar.
+
+        Wert wird beim Disable NICHT zurückgesetzt — User-Wahl bleibt erhalten,
+        damit Wechsel zurück zu einer Duplex-fähigen Source nicht jedes Mal
+        die Checkbox neu anhakt verlangt. Im start_scan-Pfad wird ohnehin
+        geprüft ob eine Duplex-Variante existiert (`mapping.get("duplex")`),
+        also kann ein 'gespeicherter True'-Wert nicht zu falschem Verhalten
+        führen — er greift nur wenn auch eine Duplex-Source verfügbar ist."""
+        if not hasattr(self, 'cb_duplex'):
+            return
+        label = self.source.get() if hasattr(self, 'source') else ""
+        mapping = self._source_map.get(label, {}) if hasattr(self, '_source_map') else {}
+        has_duplex_variant = mapping.get("duplex") is not None
+        if label == "Mehrfacheinzug" and has_duplex_variant:
+            self.cb_duplex.config(state="normal")
+        else:
+            self.cb_duplex.config(state="disabled")
+
+    def _update_physical_hint(self):
+        """Hinweis im Header-Bereich anpassen je nach Source-Wahl —
+        statt modal Dialog vor jedem Scan."""
+        src = self.source.get() if hasattr(self, 'source') else ""
+        if src == "Mehrfacheinzug":
+            self.physical_hint.config(
+                text="⚠  Vor Scan: Stapel in den Einzug · Auffang-Tray ausgezogen"
+            )
+        elif src == "Auflagenglas":
+            self.physical_hint.config(
+                text="⚠  Vor Scan: Vorlage auf Glas, Deckel zu"
+            )
+        else:
+            self.physical_hint.config(text="")
+
+    def _update_feature_availability(self):
+        """Auto-Feature-Checkboxen je nach verfügbarer Option ein/aus-graden."""
+        if not self.caps:
+            return
+        avail = self.caps["active_options"]
+        for feat_name, var, cb_widget in [
+            ("AutoDocumentSize", self.auto_size, self.cb_autosize),
+            ("AutoDeskew", self.auto_deskew, self.cb_autodeskew),
+            ("SkipBlankPage", self.skip_blank, self.cb_skipblank),
+            ("MultifeedDetection", self.multifeed, self.cb_multifeed),
+        ]:
+            if feat_name in avail:
+                cb_widget.config(state="normal")
+            else:
+                cb_widget.config(state="disabled")
+                var.set(False)
+
+    def _build_ui(self):
+        # Header
+        header = tk.Label(
+            self.root, text="Bardo Akten-Scan",
+            font=("Sans", 18, "bold"), pady=8
+        )
+        header.pack()
+
+        # Device status line
+        self.device_label = tk.Label(self.root, text="Scanner-Suche läuft...",
+                                     fg="#888", font=("Sans", 9))
+        self.device_label.pack()
+
+        # Permanent Hinweis: vor Scan-Knopf prüfen (kein modal Dialog mehr)
+        self.physical_hint = tk.Label(
+            self.root, text="", fg="#b35900",
+            font=("Sans", 10, "bold")
+        )
+        self.physical_hint.pack(pady=(2, 0))
+
+        # ---- Form ----
+        form = tk.LabelFrame(self.root, text=" Scan-Auftrag ", padx=10, pady=8)
+        form.pack(pady=8, padx=14, fill="x")
+
+        # Scanner-Wahl (Combobox, falls mehrere)
+        tk.Label(form, text="Scanner:", anchor="w").grid(
+            row=0, column=0, sticky="w", pady=2
+        )
+        self.device_combo = ttk.Combobox(form, state="readonly", width=50)
+        self.device_combo.grid(row=0, column=1, padx=6, pady=2, sticky="w")
+        self.device_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+
+        # Aktenordner name
+        tk.Label(form, text="Aktenordner-Name:", anchor="w").grid(
+            row=1, column=0, sticky="w", pady=2
+        )
+        self.name_entry = tk.Entry(form, width=44, font=("Sans", 11))
+        self.name_entry.grid(row=1, column=1, padx=6, pady=2, sticky="w")
+        self.name_entry.focus_set()
+
+        # Resolution (wird dynamisch von _on_device_change gefüllt)
+        tk.Label(form, text="Auflösung (dpi):", anchor="w").grid(
+            row=2, column=0, sticky="w", pady=2
+        )
+        self.resolution = ttk.Combobox(form, state="readonly", width=8)
+        self.resolution.grid(row=2, column=1, sticky="w", padx=6, pady=2)
+
+        # Mode (dynamisch)
+        tk.Label(form, text="Modus:", anchor="w").grid(
+            row=3, column=0, sticky="w", pady=2
+        )
+        self.mode = ttk.Combobox(form, state="readonly", width=28)
+        self.mode.grid(row=3, column=1, sticky="w", padx=6, pady=2)
+
+        # Quelle: Mehrfacheinzug oder Auflagenglas (Hardware-Realität)
+        tk.Label(form, text="Quelle:", anchor="w").grid(
+            row=4, column=0, sticky="w", pady=2
+        )
+        self.source = ttk.Combobox(form, state="readonly", width=30)
+        self.source.grid(row=4, column=1, sticky="w", padx=6, pady=2)
+
+        # Beidseitig scannen — Hardware-Duplex Checkbox
+        # Aktiv nur bei Mehrfacheinzug + Scanner kann Hardware-Duplex
+        # Für andere Fälle: Duplex-Emulation-Sektion unten benutzen
+        self.duplex_hardware = tk.BooleanVar(value=True)
+        self.cb_duplex = tk.Checkbutton(
+            form, text="Beidseitig scannen (Scanner-Duplex)",
+            variable=self.duplex_hardware
+        )
+        self.cb_duplex.grid(row=5, column=1, sticky="w", padx=6, pady=2)
+
+        # OCR-Sprache (dynamisch via tesseract --list-langs)
+        tk.Label(form, text="OCR-Sprache:", anchor="w").grid(
+            row=6, column=0, sticky="w", pady=2
+        )
+        self.ocr_lang = ttk.Combobox(form, state="readonly", width=20)
+        self.ocr_lang.grid(row=6, column=1, sticky="w", padx=6, pady=2)
+        ocr_langs = list_tesseract_langs()
+        self.ocr_lang["values"] = ocr_langs
+        self.ocr_lang.set("deu" if "deu" in ocr_langs else ocr_langs[0])
+
+        # Auto-Features
+        opts = tk.Frame(form)
+        opts.grid(row=7, column=1, sticky="w", padx=6, pady=4)
+
+        self.auto_size = tk.BooleanVar(value=True)
+        self.auto_deskew = tk.BooleanVar(value=True)
+        self.skip_blank = tk.BooleanVar(value=True)
+        self.multifeed = tk.BooleanVar(value=True)
+        self.do_ocr = tk.BooleanVar(value=True)
+
+        self.cb_autosize = tk.Checkbutton(opts, text="Auto-Document-Size",
+                       variable=self.auto_size)
+        self.cb_autosize.grid(row=0, column=0, sticky="w")
+        self.cb_autodeskew = tk.Checkbutton(opts, text="Auto-Deskew (gerade rücken)",
+                       variable=self.auto_deskew)
+        self.cb_autodeskew.grid(row=1, column=0, sticky="w")
+        self.cb_skipblank = tk.Checkbutton(opts, text="Leere Seite überspringen",
+                       variable=self.skip_blank)
+        self.cb_skipblank.grid(row=2, column=0, sticky="w")
+        self.cb_multifeed = tk.Checkbutton(opts, text="Multifeed-Detection (Doppeleinzug-Warnung)",
+                       variable=self.multifeed)
+        self.cb_multifeed.grid(row=3, column=0, sticky="w")
+        tk.Checkbutton(opts, text="OCR direkt: durchsuchbares PDF/A (deutsch)",
+                       variable=self.do_ocr,
+                       font=("Sans", 9, "bold")).grid(row=4, column=0, sticky="w", pady=(6, 0))
+
+        # ---- Big button ----
+        self.scan_btn = tk.Button(
+            self.root, text="▶  SCAN STARTEN",
+            font=("Sans", 14, "bold"),
+            bg="#2c5e2c", fg="white",
+            activebackground="#1a4a1a", activeforeground="white",
+            command=self.start_scan, height=2, cursor="hand2"
+        )
+        self.scan_btn.pack(pady=10, padx=14, fill="x")
+
+        # ---- Status ----
+        status_frame = tk.LabelFrame(self.root, text=" Status ", padx=8, pady=4)
+        status_frame.pack(padx=14, pady=4, fill="both", expand=True)
+
+        self.status = scrolledtext.ScrolledText(
+            status_frame, height=10, font=("DejaVu Sans Mono", 9), wrap="none"
+        )
+        self.status.pack(fill="both", expand=True)
+
+        # Output path link
+        self.output_label = tk.Label(
+            self.root, text="", fg="#06c", cursor="hand2",
+            font=("Sans", 10, "underline")
+        )
+        self.output_label.pack(pady=4)
+        self.output_label.bind("<Button-1>", self.open_output)
+
+        # ---- Duplex-Emulation (für Scanner ohne Duplex-Einheit) ----
+        duplex_frame = tk.LabelFrame(
+            self.root, text=" Duplex-Emulation (zwei Scans → ein Dokument) ",
+            padx=10, pady=8
+        )
+        duplex_frame.pack(pady=8, padx=14, fill="x")
+
+        explain = tk.Label(
+            duplex_frame,
+            text=("Workflow: 1) Stapel scannen   2) Stapel umdrehen + nochmal scannen   "
+                  "3) hier Aktenordner-Name + Knopf — die letzten 2 Scans werden gemergt."),
+            anchor="w", justify="left", fg="#555",
+            font=("Sans", 9), wraplength=720
+        )
+        explain.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        tk.Label(duplex_frame, text="Aktenordner-Name:", anchor="w").grid(
+            row=1, column=0, sticky="w", pady=2
+        )
+        self.duplex_name_entry = tk.Entry(duplex_frame, width=44, font=("Sans", 11))
+        self.duplex_name_entry.grid(row=1, column=1, padx=6, pady=2, sticky="w")
+
+        # Stapel-Orientierungs-Modus
+        # DAU-Anzeige -> CLI-Mode (a/b/c/d für bardo-duplex-merge)
+        self.duplex_mode_map = {
+            "Standard (Karte umdrehen, MFC-L5700DN)": "a",
+            "Lange Kante drehen": "b",
+            "Beide Stapel umgekehrt": "c",
+            "Gleiche Richtung (Front zuletzt)": "d",
+        }
+        tk.Label(duplex_frame, text="Stapel-Orientierung:", anchor="w").grid(
+            row=2, column=0, sticky="w", pady=2
+        )
+        self.duplex_mode = ttk.Combobox(
+            duplex_frame, state="readonly", width=44,
+            values=list(self.duplex_mode_map.keys())
+        )
+        self.duplex_mode.current(0)  # Standard
+        self.duplex_mode.grid(row=2, column=1, padx=6, pady=2, sticky="w")
+
+        # Verifikations-Hinweis: nur Mode 'a' ist empirisch geprüft (MFC-L5700DN
+        # 4-Iterationen-Lehrgeld). B/C/D sind theoretisch korrekt durchdacht,
+        # aber bei falscher Stapel-Konvention bekommt der User falsch sortierte
+        # Seiten — daher kleinen Stapel-Test empfehlen.
+        self.duplex_mode_hint = tk.Label(
+            duplex_frame,
+            text="A = MFC-L5700DN verifiziert · B/C/D = experimentell, "
+                 "erst an kleinem Test-Stapel prüfen",
+            font=("Sans", 8), fg="#888", anchor="w", justify="left"
+        )
+        self.duplex_mode_hint.grid(row=3, column=0, columnspan=2,
+                                    sticky="w", padx=6, pady=(0, 4))
+
+        self.duplex_btn = tk.Button(
+            duplex_frame, text="▶  DUPLEX MERGEN  (letzte 2 Scans)",
+            font=("Sans", 13, "bold"),
+            bg="#5fa8d3", fg="white",
+            activebackground="#3d7ca8", activeforeground="white",
+            command=self.start_duplex_merge, height=2, cursor="hand2"
+        )
+        self.duplex_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+
+        self.duplex_status = scrolledtext.ScrolledText(
+            duplex_frame, height=8, font=("DejaVu Sans Mono", 9), wrap="none"
+        )
+        self.duplex_status.grid(row=5, column=0, columnspan=2, sticky="ew", pady=4)
+        duplex_frame.grid_columnconfigure(1, weight=1)
+
+        self.duplex_output_label = tk.Label(
+            duplex_frame, text="", fg="#06c", cursor="hand2",
+            font=("Sans", 10, "underline")
+        )
+        self.duplex_output_label.grid(row=6, column=0, columnspan=2)
+        self.duplex_output_label.bind("<Button-1>", self.open_duplex_output)
+
+    def log(self, msg):
+        self.status.insert("end", msg + "\n")
+        self.status.see("end")
+        self.root.update_idletasks()
+
+    def start_scan(self):
+        if self.scanning:
+            return
+        if not self.device:
+            messagebox.showerror(
+                "Scanner fehlt",
+                "Brother ADS-4900W nicht erreichbar.\n"
+                "Bitte Anschluss + Strom prüfen.\n"
+                "Dann Fenster schließen und neu starten."
+            )
+            return
+
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showerror("Eingabe fehlt", "Bitte Aktenordner-Namen angeben.")
+            return
+
+        # Sanitize for filesystem
+        safe_name = re.sub(r"[^A-Za-z0-9_äöüÄÖÜß-]", "_", name)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = SCAN_BASE / safe_name / timestamp
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Quelle-Label + Duplex-Checkbox -> echter SANE-Source-String
+        source_label = self.source.get()
+        mapping = self._source_map.get(source_label, {})
+        # Strikter Check: das Mapping muss mindestens einen konkreten
+        # SANE-Source-String enthalten. Sonst niemals den DAU-Label
+        # ('Mehrfacheinzug'/'Auflagenglas') an scanimage durchreichen —
+        # das ist kein gültiger SANE-Source-String.
+        if not isinstance(mapping, dict) or not (mapping.get("single") or mapping.get("duplex")):
+            messagebox.showerror(
+                "Quelle nicht zugeordnet",
+                f"Die gewählte Quelle '{source_label}' konnte keinem konkreten\n"
+                f"SANE-Source-String zugeordnet werden.\n\n"
+                f"Bitte Scanner neu auswählen oder einen anderen Eintrag\n"
+                f"in der Quelle-Combobox wählen."
+            )
+            return
+
+        want_duplex = self.duplex_hardware.get() and mapping.get("duplex")
+        if want_duplex:
+            source = mapping["duplex"]
+        else:
+            source = mapping.get("single") or mapping.get("duplex")
+
+        cmd = [
+            "scanimage",
+            "-d", self.device,
+            "--source", source,
+            "--resolution", self.resolution.get(),
+            "--mode", self.mode.get(),
+            "--format=jpeg",
+            f"--batch={out_dir}/page%04d.jpg",
+            "-p"
+        ]
+        # Probe welche Optionen im aktuellen Zustand active sind
+        # (brscan5 markiert manche je nach Mode/Source als [inactive])
+        active_opts = probe_active_options(self.device)
+        skipped = []
+
+        def maybe_add(opt_name, value):
+            if active_opts is None or opt_name in active_opts:
+                cmd.append(f"--{opt_name}={value}")
+            else:
+                skipped.append(opt_name)
+
+        if self.auto_size.get():
+            maybe_add("AutoDocumentSize", "yes")
+        if self.auto_deskew.get():
+            maybe_add("AutoDeskew", "yes")
+        if self.skip_blank.get():
+            maybe_add("SkipBlankPage", "yes")
+        if self.multifeed.get():
+            maybe_add("MultifeedDetection", "yes")
+
+        # Pre-fill Duplex-Feld mit demselben Namen (DAU-Komfort)
+        self.duplex_name_entry.delete(0, "end")
+        self.duplex_name_entry.insert(0, name)
+
+        self.scanning = True
+        self.scan_btn.config(state="disabled", text="⏳  scannt...",
+                             bg="#888", activebackground="#888")
+        self.status.delete("1.0", "end")
+        self.log(f"Scan-Job: {safe_name} / {timestamp}")
+        if skipped:
+            self.log(f"Hinweis: Optionen aktuell inaktiv (Brother-Quirk), "
+                     f"übersprungen: {', '.join(skipped)}")
+        self.log(f"Befehl:   {' '.join(cmd)}")
+        self.log(f"Ziel:     {out_dir}")
+        self.log("─" * 70)
+        self.output_label.config(text="")
+
+        thread = threading.Thread(target=self._run_scan, args=(cmd, out_dir))
+        thread.daemon = True
+        thread.start()
+
+    def _run_scan(self, cmd, out_dir):
+        try:
+            start = time.time()
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=clean_env(), bufsize=1
+            )
+            last_progress = -10
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                # Throttle Progress-spam: nur bei jedem 10. Prozent loggen
+                m = re.match(r"Progress:\s*(\d+)\.\d+%", line)
+                if m:
+                    pct = int(m.group(1))
+                    if pct - last_progress >= 10 or pct == 100:
+                        self.log(f"  Progress: {pct}%")
+                        last_progress = pct
+                    continue
+                self.log(line)
+            proc.wait()
+            duration = time.time() - start
+
+            pages = sorted(out_dir.glob("page*.jpg"))
+            count = len(pages)
+            total_size = sum(p.stat().st_size for p in pages)
+
+            self.log("─" * 70)
+            self.log(f"Fertig: {count} Seiten, {total_size/1024/1024:.1f} MB, "
+                     f"{duration:.1f}s")
+
+            if count == 0:
+                self.log("KEIN OUTPUT — ADF leer oder Scan-Fehler.")
+                self.log(f"Ordner bleibt erhalten zur Diagnose: {out_dir}")
+            else:
+                self._last_output = out_dir
+                # OCR-Stage falls aktiviert
+                final_pdf = None
+                if self.do_ocr.get():
+                    final_pdf = self._run_ocr_pipeline(out_dir, pages)
+                # Manifest schreiben (SHA256 über alle Outputs)
+                self._write_manifest(out_dir)
+                # Output-Label: searchable PDF priorisieren wenn vorhanden
+                if final_pdf and final_pdf.exists():
+                    self.output_label.config(
+                        text=f"📄  {final_pdf.name}  ←  durchsuchbare PDF (klicken)"
+                    )
+                else:
+                    self.output_label.config(
+                        text=f"📁  {out_dir}  (klicken um zu öffnen)"
+                    )
+        except Exception as e:
+            self.log(f"FEHLER: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+        finally:
+            self.scanning = False
+            self.scan_btn.config(
+                state="normal", text="▶  SCAN STARTEN",
+                bg="#2c5e2c", activebackground="#1a4a1a"
+            )
+
+    def _run_ocr_pipeline(self, out_dir, pages):
+        """Output-Pipeline:
+          (1) JPEGs → Beweis-PDF (image-only, immutable)
+          (2) ocrmypdf → Searchable Bulk-PDF
+          (3) pdfseparate → page0001.pdf ... (Einzelseiten MIT OCR-Layer)
+          (4) pdftotext → page0001.txt ... (reiner Text pro Seite)
+          (5) JPEGs entfernen (redundant, im Beweis-PDF schon enthalten)
+        """
+        try:
+            self.log("─" * 70)
+            self.log("OCR-Stage startet (deutsch, Tesseract)...")
+            t0 = time.time()
+            stem = out_dir.name
+            raw_pdf = out_dir / f"{stem}.pdf"
+            search_pdf = out_dir / f"{stem}.searchable.pdf"
+
+            # (1) JPEGs zu Image-only PDF
+            jpg_paths = [str(p) for p in pages]
+            self.log(f"  [1/5] kombiniere {len(jpg_paths)} JPEGs zu Beweis-PDF...")
+            r = subprocess.run(
+                ["img2pdf"] + jpg_paths + ["-o", str(raw_pdf)],
+                capture_output=True, text=True, env=clean_env(), timeout=300
+            )
+            if r.returncode != 0 or not raw_pdf.exists():
+                self.log(f"  img2pdf-Fehler: {r.stderr.strip()[:300]}")
+                return None
+            self.log(f"  Beweis-PDF: {raw_pdf.name} ({raw_pdf.stat().st_size/1024/1024:.1f} MB)")
+
+            # (2) ocrmypdf → Searchable Bulk-PDF
+            cpu_total = os.cpu_count() or 2
+            ocr_jobs = max(1, cpu_total // 2)
+            ocr_lang = self.ocr_lang.get() or "deu"
+            self.log(f"  [2/5] OCR (Tesseract {ocr_lang}) → PDF/A-2B "
+                     f"(--jobs {ocr_jobs} von {cpu_total} Kernen)...")
+            ocr_cmd = ["ocrmypdf",
+                       "-l", ocr_lang,
+                       "--output-type", "pdfa",
+                       "--skip-text",
+                       "--jobs", str(ocr_jobs),
+                       str(raw_pdf), str(search_pdf)]
+            ocr_proc = subprocess.Popen(
+                ocr_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=clean_env(), bufsize=1
+            )
+            # tqdm-Format: "Scanning contents:  45%|..."  oder  "OCR: 12%|..."
+            last_phase, last_pct = None, -10
+            tail_lines = []  # für Fehler-Diagnose wenn returncode != 0
+            try:
+                for line in ocr_proc.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    tail_lines.append(line)
+                    if len(tail_lines) > 40:
+                        tail_lines.pop(0)
+                    m = re.match(r"\s*([A-Za-z][\w\- ]*?)\s*:\s*(\d+)%", line)
+                    if m:
+                        phase, pct = m.group(1).strip(), int(m.group(2))
+                        if phase != last_phase or pct - last_pct >= 10 or pct == 100:
+                            self.log(f"     {phase}: {pct}%")
+                            last_phase, last_pct = phase, pct
+                        continue
+                    upper = line.upper()
+                    if "ERROR" in upper or "WARNING" in upper or "FAIL" in upper:
+                        self.log(f"     {line}")
+                ocr_proc.wait(timeout=1800)
+            except subprocess.TimeoutExpired:
+                ocr_proc.kill()
+                self.log(f"  ocrmypdf-Timeout (>1800s) — Beweis-PDF bleibt nutzbar")
+                return raw_pdf
+            if ocr_proc.returncode != 0 or not search_pdf.exists():
+                err_summary = " | ".join(tail_lines[-5:])[:400]
+                self.log(f"  ocrmypdf-Fehler (rc={ocr_proc.returncode}): {err_summary}")
+                self.log(f"  Beweis-PDF bleibt nutzbar: {raw_pdf}")
+                return raw_pdf
+            self.log(f"  Searchable PDF: {search_pdf.name} ({search_pdf.stat().st_size/1024/1024:.1f} MB)")
+
+            # Subfolders pro Datei-Typ (sauberes Drag-Drop, klare Trennung)
+            pdf_dir = out_dir / "pdf"
+            txt_dir = out_dir / "txt"
+            pdf_dir.mkdir(exist_ok=True)
+            txt_dir.mkdir(exist_ok=True)
+
+            # (3) Per-Seite-PDFs (jede mit OCR-Layer) — Konsum-Substrat in pdf/
+            self.log(f"  [3/5] Splitte in pdf/ (Einzelseiten mit OCR-Layer)...")
+            r = subprocess.run(
+                ["pdfseparate", str(search_pdf), str(pdf_dir / "page%04d.pdf")],
+                capture_output=True, text=True, env=clean_env(), timeout=300
+            )
+            page_pdfs = sorted(pdf_dir.glob("page*.pdf"))
+            if r.returncode != 0 or not page_pdfs:
+                self.log(f"  pdfseparate-Fehler: {r.stderr.strip()[:300]}")
+                self.log(f"  Bulk-PDFs bleiben nutzbar")
+            else:
+                total_size = sum(p.stat().st_size for p in page_pdfs) / 1024 / 1024
+                self.log(f"  Einzelseiten-PDFs in pdf/: {len(page_pdfs)} ({total_size:.1f} MB)")
+
+            # (4) Per-Seite-TXT aus Searchable PDF — in txt/
+            self.log(f"  [4/5] Per-Seite-TXT in txt/ extrahieren (für Maschinen)...")
+            txt_count = 0
+            for i in range(1, len(pages) + 1):
+                txt_path = txt_dir / f"page{i:04d}.txt"
+                rt = subprocess.run(
+                    ["pdftotext", "-layout", "-f", str(i), "-l", str(i),
+                     str(search_pdf), str(txt_path)],
+                    capture_output=True, text=True, env=clean_env(), timeout=60
+                )
+                if rt.returncode == 0 and txt_path.exists():
+                    txt_count += 1
+            self.log(f"  Per-Seite-TXT in txt/: {txt_count}/{len(pages)} Dateien")
+
+            # (5) JPEGs entfernen — nur wenn Beweis-PDF bestätigt existiert
+            if raw_pdf.exists() and raw_pdf.stat().st_size > 0:
+                self.log(f"  [5/5] Roh-JPEGs entfernen (im Beweis-PDF dupliziert)...")
+                removed = 0
+                for jpg in pages:
+                    try:
+                        jpg.unlink()
+                        removed += 1
+                    except OSError as e:
+                        self.log(f"    Konnte {jpg.name} nicht löschen: {e}")
+                self.log(f"  {removed} JPEGs entfernt")
+            else:
+                self.log(f"  [5/5] JPEGs bleiben (Beweis-PDF nicht verifiziert)")
+
+            self.log(f"  Pipeline-Dauer: {time.time()-t0:.1f}s")
+            return search_pdf
+        except subprocess.TimeoutExpired:
+            self.log("  Pipeline-Timeout — bei großen Stapeln nachholen")
+            return None
+        except Exception as e:
+            self.log(f"  Pipeline-Fehler: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            return None
+
+    def _write_manifest(self, out_dir):
+        """SHA256-Manifest ALLER Outputs (Bulk-PDFs + pdf/* + txt/* + ggf. JPEGs)."""
+        try:
+            import hashlib
+            files = (
+                sorted(out_dir.glob("*.pdf")) +              # Bulk-PDFs (top level)
+                sorted((out_dir / "pdf").glob("*.pdf")) +    # Einzelseiten-PDFs
+                sorted((out_dir / "txt").glob("*.txt")) +    # Einzelseiten-TXTs
+                sorted(out_dir.glob("page*.jpg"))            # ggf. JPEGs (nur bei Fehler)
+            )
+            manifest_lines = [
+                f"# Bardo Akten-Scan Manifest",
+                f"# Generiert: {datetime.now().isoformat()}",
+                f"# Ordner: {out_dir}",
+                f"# Dateien: {len(files)}",
+                f"#",
+            ]
+            for p in files:
+                h = hashlib.sha256()
+                with open(p, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+                # Pfad relativ zum Job-Ordner für Lesbarkeit
+                rel = p.relative_to(out_dir)
+                manifest_lines.append(f"{h.hexdigest()}  {rel}")
+            (out_dir / "sha256.txt").write_text("\n".join(manifest_lines) + "\n")
+            self.log(f"Manifest: sha256.txt ({len(files)} Dateien)")
+        except Exception as e:
+            self.log(f"Manifest-Fehler: {e}")
+
+    def open_output(self, event=None):
+        """Öffnet die durchsuchbare PDF wenn vorhanden, sonst den Ordner."""
+        if not self._last_output or not self._last_output.exists():
+            return
+        searchable = list(self._last_output.glob("*.searchable.pdf"))
+        target = str(searchable[0]) if searchable else str(self._last_output)
+        subprocess.Popen(["xdg-open", target], env=clean_env())
+
+    # ---- Duplex-Emulation ----
+
+    def duplex_log(self, msg):
+        self.duplex_status.insert("end", msg + "\n")
+        self.duplex_status.see("end")
+        self.root.update_idletasks()
+
+    def start_duplex_merge(self):
+        """Sucht letzte 2 Scan-Jobs im angegebenen Aktenordner, mergt zu Duplex-Output."""
+        if self.duplex_running:
+            return
+        # Default vom letzten Scan-Namen falls leer
+        name = self.duplex_name_entry.get().strip()
+        if not name:
+            name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showerror(
+                "Eingabe fehlt",
+                "Aktenordner-Name fehlt. Entweder oben (für Scan) oder hier eintragen."
+            )
+            return
+        safe_name = re.sub(r"[^A-Za-z0-9_äöüÄÖÜß-]", "_", name)
+        folder = SCAN_BASE / safe_name
+        if not folder.is_dir():
+            messagebox.showerror(
+                "Aktenordner nicht da",
+                f"~/Akten-Scans/{safe_name}/ existiert nicht.\n"
+                "Erst zwei Scans in diesen Aktenordner machen."
+            )
+            return
+        # Scan-Jobs (timestamp-Ordner) finden, ohne *-duplex-Outputs
+        all_scan_dirs = [d for d in sorted(folder.iterdir())
+                         if d.is_dir() and not d.name.endswith("-duplex")]
+        # Duplex-Merge braucht den pdf/-Subordner aus der OCR-Pipeline
+        scan_jobs = [d for d in all_scan_dirs if (d / "pdf").is_dir()]
+        no_ocr_count = len(all_scan_dirs) - len(scan_jobs)
+        if len(scan_jobs) < 2:
+            msg = (f"Im Aktenordner '{safe_name}' sind nur {len(scan_jobs)} "
+                   f"OCR-fertige Scan-Jobs.\nMindestens 2 nötig "
+                   f"(Vorderseiten + Rückseiten).")
+            if no_ocr_count > 0:
+                msg += (f"\n\nHinweis: {no_ocr_count} weitere Scan(s) ohne "
+                        f"OCR-Output (kein pdf/-Unterordner) gefunden.\n"
+                        f"Duplex-Merge braucht die OCR-Einzelseiten — "
+                        f"oben die OCR-Checkbox aktivieren\n"
+                        f"und neu scannen.")
+            messagebox.showerror("Zu wenig Scans", msg)
+            return
+        front_dir = scan_jobs[-2]
+        back_dir = scan_jobs[-1]
+
+        # Bestätigung
+        confirmed = messagebox.askyesno(
+            "Duplex-Merge bestätigen",
+            "Die letzten zwei Scans im Aktenordner werden gemergt:\n\n"
+            f"  Vorderseiten: {front_dir.name}\n"
+            f"  Rückseiten:   {back_dir.name}\n\n"
+            f"Aktenordner:    {safe_name}\n"
+            f"Output:         ~/Akten-Scans/{safe_name}/<timestamp>-duplex/\n\n"
+            "Quell-Ordner bleiben unverändert (immutable Original-Beweis).\n"
+            "Starten?"
+        )
+        if not confirmed:
+            return
+
+        self.duplex_running = True
+        self.duplex_btn.config(state="disabled", text="⏳  Merge läuft...",
+                                bg="#888", activebackground="#888")
+        self.duplex_status.delete("1.0", "end")
+        self.duplex_log(f"Aktenordner: {safe_name}")
+        self.duplex_log(f"Front:       {front_dir.name}")
+        self.duplex_log(f"Back:        {back_dir.name}")
+        self.duplex_log("─" * 70)
+        self.duplex_output_label.config(text="")
+
+        # Mode aus Combobox (DAU-Anzeige) → interne CLI-Mode-ID
+        mode_label = self.duplex_mode.get()
+        mode = self.duplex_mode_map.get(mode_label, "a")
+
+        thread = threading.Thread(
+            target=self._run_duplex_merge,
+            args=(front_dir, back_dir, safe_name, mode)
+        )
+        thread.daemon = True
+        thread.start()
+
+    def _run_duplex_merge(self, front_dir, back_dir, aktenname, mode="a"):
+        """Ruft bardo-duplex-merge als Subprocess auf, streamt Output ins Status-Fenster."""
+        try:
+            proc = subprocess.Popen(
+                ["bardo-duplex-merge", str(front_dir), str(back_dir), aktenname,
+                 "--mode", mode],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=clean_env(), bufsize=1
+            )
+            for line in proc.stdout:
+                self.duplex_log(line.rstrip())
+            proc.wait()
+            if proc.returncode == 0:
+                # Neuesten -duplex-Ordner finden
+                folder = SCAN_BASE / aktenname
+                duplex_dirs = sorted([d for d in folder.iterdir()
+                                       if d.is_dir() and d.name.endswith("-duplex")])
+                if duplex_dirs:
+                    latest = duplex_dirs[-1]
+                    self._duplex_last_output = latest
+                    searchable = list(latest.glob("*.searchable.pdf"))
+                    if searchable:
+                        self.duplex_output_label.config(
+                            text=f"📄  {searchable[0].name}  (klicken um zu öffnen)"
+                        )
+                    else:
+                        self.duplex_output_label.config(
+                            text=f"📁  {latest}  (klicken um zu öffnen)"
+                        )
+            else:
+                self.duplex_log(f"FEHLER (Returncode {proc.returncode})")
+        except FileNotFoundError:
+            self.duplex_log("FEHLER: bardo-duplex-merge nicht gefunden im PATH.")
+        except Exception as e:
+            self.duplex_log(f"FEHLER: {e}")
+            import traceback
+            self.duplex_log(traceback.format_exc())
+        finally:
+            self.duplex_running = False
+            self.duplex_btn.config(
+                state="normal", text="▶  DUPLEX MERGEN  (letzte 2 Scans)",
+                bg="#5fa8d3", activebackground="#3d7ca8"
+            )
+
+    def open_duplex_output(self, event=None):
+        """Öffnet das durchsuchbare Duplex-PDF, sonst den Ordner."""
+        if not self._duplex_last_output or not self._duplex_last_output.exists():
+            return
+        searchable = list(self._duplex_last_output.glob("*.searchable.pdf"))
+        target = str(searchable[0]) if searchable else str(self._duplex_last_output)
+        subprocess.Popen(["xdg-open", target], env=clean_env())
+
+
+def main():
+    root = tk.Tk()
+    BardoScanApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
